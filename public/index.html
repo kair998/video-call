@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebRTC 视频通话</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 16px;
+        }
+        .container {
+            max-width: 800px;
+            width: 100%;
+            background: #16213e;
+            border-radius: 24px;
+            padding: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+        }
+        h1 {
+            color: #e94560;
+            text-align: center;
+            margin-bottom: 20px;
+            font-size: 1.5rem;
+        }
+        .room-panel {
+            background: #0f3460;
+            padding: 20px;
+            border-radius: 16px;
+            margin-bottom: 20px;
+        }
+        .room-panel input {
+            width: 100%;
+            padding: 12px;
+            margin: 8px 0;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            background: #1a1a2e;
+            color: white;
+        }
+        .room-panel button {
+            width: 100%;
+            padding: 12px;
+            background: #e94560;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            font-weight: bold;
+            cursor: pointer;
+            margin-top: 8px;
+        }
+        .room-panel button:disabled {
+            background: #555;
+            cursor: not-allowed;
+        }
+        .video-container {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            margin-bottom: 20px;
+        }
+        .video-wrapper {
+            background: #0f3460;
+            border-radius: 16px;
+            overflow: hidden;
+            position: relative;
+        }
+        .video-wrapper label {
+            position: absolute;
+            top: 8px;
+            left: 12px;
+            background: rgba(0,0,0,0.6);
+            color: white;
+            padding: 4px 8px;
+            border-radius: 6px;
+            font-size: 12px;
+            z-index: 1;
+        }
+        video {
+            width: 100%;
+            background: #0a0a1a;
+            display: block;
+        }
+        .controls {
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+        }
+        .controls button {
+            padding: 12px 20px;
+            background: #e94560;
+            color: white;
+            border: none;
+            border-radius: 40px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        .controls button:active { transform: scale(0.98); }
+        .status {
+            text-align: center;
+            color: #ccc;
+            margin-top: 16px;
+            font-size: 14px;
+        }
+        @media (min-width: 768px) {
+            .video-container {
+                flex-direction: row;
+            }
+            .video-wrapper { flex: 1; }
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>📹 视频通话</h1>
+    
+    <div class="room-panel" id="roomPanel">
+        <input type="text" id="roomInput" placeholder="房间号 (例如: 123)" value="test123">
+        <input type="text" id="nameInput" placeholder="你的名字" value="">
+        <button id="joinBtn">🔗 加入房间</button>
+    </div>
+    
+    <div id="callUI" style="display: none;">
+        <div class="video-container">
+            <div class="video-wrapper">
+                <label>本地视频</label>
+                <video id="localVideo" autoplay muted playsinline></video>
+            </div>
+            <div class="video-wrapper">
+                <label>对方视频</label>
+                <video id="remoteVideo" autoplay playsinline></video>
+            </div>
+        </div>
+        <div class="controls">
+            <button id="toggleAudioBtn">🔇 静音</button>
+            <button id="toggleVideoBtn">📷 关摄像头</button>
+            <button id="hangupBtn">📞 挂断</button>
+        </div>
+        <div class="status" id="status">等待连接...</div>
+    </div>
+</div>
+
+<script>
+// ============ 配置 ============
+// 使用公共STUN服务器（用于NAT穿透）
+const CONFIG = {
+    iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: 'stun:stun2.l.google.com:19302' },
+        {
+            urls: 'turn:8.136.3.81:3478',
+            username: 'myuser',
+            credential: 'mypassword'
+        }
+    ]
+};
+
+// ============ DOM 元素 ============
+const roomPanel = document.getElementById('roomPanel');
+const callUI = document.getElementById('callUI');
+const roomInput = document.getElementById('roomInput');
+const nameInput = document.getElementById('nameInput');
+const joinBtn = document.getElementById('joinBtn');
+const localVideo = document.getElementById('localVideo');
+const remoteVideo = document.getElementById('remoteVideo');
+const toggleAudioBtn = document.getElementById('toggleAudioBtn');
+const toggleVideoBtn = document.getElementById('toggleVideoBtn');
+const hangupBtn = document.getElementById('hangupBtn');
+const statusDiv = document.getElementById('status');
+
+// ============ 全局变量 ============
+let localStream = null;           // 本地媒体流
+let peerConnection = null;        // RTCPeerConnection 实例
+let ws = null;                    // WebSocket 连接
+let roomId = null;                // 当前房间号
+let myName = null;                // 我的名字
+let isInCall = false;             // 是否在通话中
+let audioEnabled = true;
+let videoEnabled = true;
+
+// ============ WebSocket 连接 ============
+function connectWebSocket(room, name) {
+    // 使用当前页面的host，如果是localhost:3000就用这个
+    const wsUrl = `ws://${window.location.host}`;
+    ws = new WebSocket(wsUrl);
+    
+    ws.onopen = () => {
+        console.log('WebSocket 已连接');
+        ws.send(JSON.stringify({
+            type: 'join',
+            room: room,
+            name: name
+        }));
+    };
+    
+    ws.onmessage = async (event) => {
+        const data = JSON.parse(event.data);
+        console.log('收到信令:', data.type);
+        
+        switch(data.type) {
+            case 'peer-joined':
+                statusDiv.innerText = '对方已加入，正在建立连接...';
+                // 作为发起方，创建Offer
+                await createOffer();
+                break;
+                
+            case 'offer':
+                if (peerConnection) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+                    await createAnswer();
+                }
+                break;
+                
+            case 'answer':
+                if (peerConnection) {
+                    await peerConnection.setRemoteDescription(new RTCSessionDescription(data));
+                }
+                break;
+                
+            case 'ice-candidate':
+                if (peerConnection && data.candidate) {
+                    try {
+                        await peerConnection.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    } catch(e) {
+                        console.error('添加ICE候选失败:', e);
+                    }
+                }
+                break;
+                
+            case 'peer-left':
+                statusDiv.innerText = '对方已离开';
+                hangUp();
+                break;
+        }
+    };
+    
+    ws.onerror = (error) => {
+        console.error('WebSocket错误:', error);
+        statusDiv.innerText = '连接服务器失败';
+    };
+    
+    ws.onclose = () => {
+        console.log('WebSocket断开');
+        if (isInCall) hangUp();
+    };
+}
+
+// ============ 创建 PeerConnection ============
+async function createPeerConnection() {
+    peerConnection = new RTCPeerConnection(CONFIG);
+    
+    // 添加本地流的所有track
+    if (localStream) {
+        localStream.getTracks().forEach(track => {
+            peerConnection.addTrack(track, localStream);
+        });
+    }
+    
+    // 监听远程流
+    peerConnection.ontrack = (event) => {
+        console.log('收到远程流');
+        if (remoteVideo.srcObject !== event.streams[0]) {
+            remoteVideo.srcObject = event.streams[0];
+        }
+    };
+    
+    // 收集ICE候选并发送
+    peerConnection.onicecandidate = (event) => {
+        if (event.candidate) {
+            ws.send(JSON.stringify({
+                type: 'ice-candidate',
+                room: roomId,
+                candidate: event.candidate
+            }));
+        }
+    };
+    
+    // 连接状态变化
+    peerConnection.onconnectionstatechange = () => {
+        console.log('连接状态:', peerConnection.connectionState);
+        switch(peerConnection.connectionState) {
+            case 'connected':
+                statusDiv.innerText = '✅ 已连接，通话中';
+                break;
+            case 'disconnected':
+                statusDiv.innerText = '⚠️ 连接断开';
+                break;
+            case 'failed':
+                statusDiv.innerText = '❌ 连接失败';
+                break;
+        }
+    };
+}
+
+// ============ 发起方: 创建 Offer ============
+async function createOffer() {
+    if (!peerConnection) {
+        await createPeerConnection();
+    }
+    
+    const offer = await peerConnection.createOffer();
+    await peerConnection.setLocalDescription(offer);
+    
+    ws.send(JSON.stringify({
+        type: 'offer',
+        room: roomId,
+        sdp: offer.sdp,
+        type_sdp: offer.type
+    }));
+}
+
+// ============ 应答方: 创建 Answer ============
+async function createAnswer() {
+    const answer = await peerConnection.createAnswer();
+    await peerConnection.setLocalDescription(answer);
+    
+    ws.send(JSON.stringify({
+        type: 'answer',
+        room: roomId,
+        sdp: answer.sdp,
+        type_sdp: answer.type
+    }));
+}
+
+// ============ 获取本地媒体流 ============
+async function getLocalStream() {
+    try {
+        // 指定采集参数：640x480 分辨率，15fps 帧率
+        const stream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                width: { exact: 640 },   // 宽度 640px（原来是 1280）
+                height: { exact: 480 },  // 高度 480px（原来是 720）
+                frameRate: { exact: 15 } // 帧率 15fps（原来是 30）
+            },
+            audio: true
+        });
+        localStream = stream;
+        localVideo.srcObject = stream;
+        return true;
+    } catch (err) {
+        console.error('获取摄像头失败:', err);
+        statusDiv.innerText = '无法获取摄像头/麦克风权限';
+        return false;
+    }
+}
+
+// ============ 加入房间 ============
+async function joinRoom() {
+    roomId = roomInput.value.trim();
+    myName = nameInput.value.trim() || `用户_${Math.floor(Math.random() * 1000)}`;
+    
+    if (!roomId) {
+        alert('请输入房间号');
+        return;
+    }
+    
+    joinBtn.disabled = true;
+    joinBtn.innerText = '正在加入...';
+    
+    // 获取本地媒体流
+    const hasMedia = await getLocalStream();
+    if (!hasMedia) {
+        joinBtn.disabled = false;
+        joinBtn.innerText = '加入房间';
+        return;
+    }
+    
+    // 连接信令服务器
+    connectWebSocket(roomId, myName);
+    
+    // 创建 PeerConnection（但不立即创建Offer，等待对方加入）
+    await createPeerConnection();
+    
+    // 显示通话界面
+    roomPanel.style.display = 'none';
+    callUI.style.display = 'block';
+    isInCall = true;
+    
+    statusDiv.innerText = '等待对方加入...';
+}
+
+// ============ 挂断 ============
+function hangUp() {
+    if (peerConnection) {
+        peerConnection.close();
+        peerConnection = null;
+    }
+    
+    if (localStream) {
+        localStream.getTracks().forEach(track => track.stop());
+        localStream = null;
+    }
+    
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'leave',
+            room: roomId
+        }));
+        ws.close();
+    }
+    
+    localVideo.srcObject = null;
+    remoteVideo.srcObject = null;
+    
+    roomPanel.style.display = 'block';
+    callUI.style.display = 'none';
+    isInCall = false;
+    joinBtn.disabled = false;
+    joinBtn.innerText = '加入房间';
+}
+
+// ============ 切换音频 ============
+function toggleAudio() {
+    if (localStream) {
+        const audioTrack = localStream.getAudioTracks()[0];
+        if (audioTrack) {
+            audioEnabled = !audioEnabled;
+            audioTrack.enabled = audioEnabled;
+            toggleAudioBtn.innerText = audioEnabled ? '🔇 静音' : '🔊 取消静音';
+        }
+    }
+}
+
+// ============ 切换视频 ============
+function toggleVideo() {
+    if (localStream) {
+        const videoTrack = localStream.getVideoTracks()[0];
+        if (videoTrack) {
+            videoEnabled = !videoEnabled;
+            videoTrack.enabled = videoEnabled;
+            toggleVideoBtn.innerText = videoEnabled ? '📷 关摄像头' : '📷 开摄像头';
+        }
+    }
+}
+
+// ============ 绑定事件 ============
+joinBtn.addEventListener('click', joinRoom);
+hangupBtn.addEventListener('click', hangUp);
+toggleAudioBtn.addEventListener('click', toggleAudio);
+toggleVideoBtn.addEventListener('click', toggleVideo);
+</script>
+</body>
+</html>
